@@ -1,208 +1,138 @@
 """
-Source - Data Warehouse & ETL Automation Setup
-==================================================
-Creates the SQLite Relational Database, defines the Star Schema, 
-and executes the ETL (Extract, Transform, Load) pipeline from the raw CSV.
+CCP - Complete CRISP Pipeline Orchestrator (Standard Production Mode)
+========================================================================
+Master controller that sequentially executes data warehouse ETL processing,
+queries dataset keeping native precise case mapping, and executes downstream pipelines.
 
-File Location: source/database_setup.py
+File Location: model/ccp.py
+Usage:
+    python model/ccp.py
 """
 
 import os
+import sys
+import time
+import io
 import sqlite3
 import pandas as pd
 
+# Force UTF-8 stdout so box-drawing and emoji chars render perfectly on Windows
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
-def build_star_schema(csv_path, db_path):
-    """Reads raw TaiwanData.csv and populates the SQLite Star Schema database.
+# ---------------------------------------------------------------------------
+# Path setup - ensure cross-directory imports work regardless of CWD
+# ---------------------------------------------------------------------------
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, os.pardir))
 
-    Parameters
-    ----------
-    csv_path : str
-        Path to the input raw CSV file.
-    db_path : str
-        Target path where the SQLite database (.db) file will be saved.
-    """
-    print(f"\n📡 [ETL] Initializing Data Warehouse Database at:\n     {db_path}")
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-    # Ensure input CSV file exists
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(
-            f"❌ [ERROR] Raw data file nahi mili is path par: {csv_path}"
-        )
+# Core resource targets mapping
+DATA_PATH = os.path.join(PROJECT_ROOT, "data", "TaiwanData.csv")
+DB_PATH = os.path.join(PROJECT_ROOT, "data", "Warehouse_Credit_Risk.db")  
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, "output")
 
-    # Clean old database file if exists to wipe out corrupted binary data types
-    if os.path.exists(db_path):
-        print("🗑️ [ETL] Removing existing database file for a fresh clean rebuild...")
+# Import modular operational source layers safely from source directory
+from source.database_setup import build_star_schema
+from source.objective1 import run_classification
+from source.objective2 import run_clustering
+from source.objective3 import run_olap
+
+
+def _banner(title):
+    print("\n" + "="*70)
+    print(f" {title}")
+    print("="*70)
+
+
+def main():
+    pipeline_start = time.time()
+    
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    # Prevent Duplicates: Wipe previous Sqlite file securely
+    if os.path.exists(DB_PATH):
         try:
-            os.remove(db_path)
-        except Exception as e:
-            print(f"⚠️ [WARNING] Could not remove old DB file, attempting overwrite: {e}")
+            os.remove(DB_PATH)
+            print("🗑️  [SYSTEM] Old database file deleted to enforce clean data types.")
+        except Exception:
+            pass
 
-    # -------------------------------------------------------------------------
-    # 1. EXTRACT: Read the Raw Flat File Data
-    # -------------------------------------------------------------------------
-    print("📥 [ETL] Extracting data from raw CSV file...")
-    df = pd.read_csv(csv_path)
+    _banner("CRISP-DM MULTI-OBJECTIVE PIPELINE WITH DATA WAREHOUSE")
+    print(f"  Project Root     : {PROJECT_ROOT}")
+    print(f"  Target Database  : {DB_PATH}")
+    print(f"  Output Directory : {OUTPUT_DIR}")
 
-    # -------------------------------------------------------------------------
-    # 2. TRANSFORM: Clean Data & Define Dimension Mapping Rules
-    # -------------------------------------------------------------------------
-    print("🛠️ [ETL] Transforming data & preparing dimension encodings...")
+    # ── PHASE 0: DATABASE PIPELINE & ETL EXECUTION ──────────────────────────
+    _banner("PHASE 0 -- Data Warehouse Extraction, Transformation & Load")
+    build_star_schema(DATA_PATH, DB_PATH)
 
-    # Data Cleaning standardisation
-    df["EDUCATION"] = df["EDUCATION"].clip(1, 4)
-    df["MARRIAGE"] = df["MARRIAGE"].clip(1, 3)
+    # ── PHASE 1: DATA SOURCE EXTRACTION VIA SQL JOIN ────────────────________
+    print("\n📥 Extracting Dataset via Data Warehouse Join Query...")
+    conn = sqlite3.connect(DB_PATH)
+    
+    # CASE RESOLVED QUERY: 
+    # 'class' column is kept lowercase for Objective 1.
+    # 'Age' is aliased as 'AGE' for Objective 3.
+    query = """
+    SELECT 
+        f.Customer_ID as ID, f.LIMIT_BAL, f.Default_Status as class,
+        f.PAY_0, f.PAY_2, f.PAY_3, f.PAY_4, f.PAY_5, f.PAY_6,
+        f.BILL_AMT1, f.BILL_AMT2, f.BILL_AMT3, f.BILL_AMT4, f.BILL_AMT5, f.BILL_AMT6,
+        f.PAY_AMT1, f.PAY_AMT2, f.PAY_AMT3, f.PAY_AMT4, f.PAY_AMT5, f.PAY_AMT6,
+        d.Age as AGE,
+        CASE WHEN c.Gender = 'Male' THEN 1 ELSE 2 END as SEX,
+        CASE 
+            WHEN c.Education_Level = 'Graduate School' THEN 1 
+            WHEN c.Education_Level = 'University' THEN 2 
+            WHEN c.Education_Level = 'High School' THEN 3 
+            ELSE 4 
+        END as EDUCATION,
+        CASE 
+            WHEN c.Marital_Status = 'Married' THEN 1 
+            WHEN c.Marital_Status = 'Single' THEN 2 
+            ELSE 3 
+        END as MARRIAGE
+    FROM Fact_Credit_Risk f
+    JOIN Dim_Customer c ON f.Customer_ID = c.Customer_ID
+    JOIN Dim_Demographics d ON f.Demographic_ID = d.Demographic_ID;
+    """
+    
+    df_raw = pd.read_sql_query(query, conn)
+    conn.close()
 
-    # Human-readable mapping definitions for OLAP / Dimensional analysis
-    gender_map = {1: "Male", 2: "Female"}
-    edu_map = {
-        1: "Graduate School",
-        2: "University",
-        3: "High School",
-        4: "Others",
-    }
-    marriage_map = {1: "Married", 2: "Single", 3: "Others"}
+    print(f"  [OK] Successfully retrieved {len(df_raw)} safe numeric rows via SQL Engine.")
 
-    def get_age_group(age):
-        if age < 25:
-            return "Under 25"
-        elif age <= 35:
-            return "25-35"
-        elif age <= 45:
-            return "36-45"
-        elif age <= 55:
-            return "46-55"
-        else:
-            return "Above 55"
+    # Segregate features matrix slice safely
+    df_ml_input = df_raw.copy()
+    if "ID" in df_ml_input.columns:
+        df_ml_input.drop(columns=["ID"], inplace=True)
 
-    # -------------------------------------------------------------------------
-    # 3. LOAD: Connect to DB and Create Star Schema Tables (DDL)
-    # -------------------------------------------------------------------------
-    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    # ── PHASE 2: OBJECTIVE 1 MODEL RUNNING ──────────────────────────────────
+    _banner("PHASE 1 -- Objective 1: Default Prediction (Classification)")
+    df_clean = run_classification(df_ml_input, OUTPUT_DIR)
+    
+    # Re-attach target identity sequence back using local alignment matching
+    df_clean["ID"] = df_raw["ID"].values
 
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
+    # ── PHASE 3: OBJECTIVE 2 SEGMENTATION RUNNING ───────────────────────────
+    _banner("PHASE 2 -- Objective 2: Risk Segmentation (Clustering)")
+    df_segmented = run_clustering(df_clean, OUTPUT_DIR)
 
-    # Enforce Foreign Key relational constraints in SQLite backend
-    cursor.execute("PRAGMA foreign_keys = ON;")
+    # ── PHASE 4: OBJECTIVE 3 MULTIDIMENSIONAL SUMMARY RUNNING ───────────────
+    _banner("PHASE 3 -- Objective 3: Multi-dimensional OLAP Cube")
+    run_olap(df_segmented, OUTPUT_DIR)
 
-    print("🏗️ [ETL] Building Star Schema structural layout tables...")
-
-    # DIMENSION TABLE 1: Customer Profile Details
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS Dim_Customer (
-        Customer_ID INTEGER PRIMARY KEY,
-        Gender TEXT,
-        Education_Level TEXT,
-        Marital_Status TEXT
-    )
-    """)
-
-    # DIMENSION TABLE 2: Demographics & Time-less Attributes
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS Dim_Demographics (
-        Demographic_ID INTEGER PRIMARY KEY AUTOINCREMENT,
-        Age INTEGER,
-        Age_Group TEXT
-    )
-    """)
-
-    # CENTRAL FACT TABLE: All transaction bills, metrics and target tags
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS Fact_Credit_Risk (
-        Fact_ID INTEGER PRIMARY KEY AUTOINCREMENT,
-        Customer_ID INTEGER,
-        Demographic_ID INTEGER,
-        LIMIT_BAL REAL,
-        PAY_0 INTEGER, PAY_2 INTEGER, PAY_3 INTEGER, 
-        PAY_4 INTEGER, PAY_5 INTEGER, PAY_6 INTEGER,
-        BILL_AMT1 REAL, BILL_AMT2 REAL, BILL_AMT3 REAL, 
-        BILL_AMT4 REAL, BILL_AMT5 REAL, BILL_AMT6 REAL,
-        PAY_AMT1 REAL, PAY_AMT2 REAL, PAY_AMT3 REAL, 
-        PAY_AMT4 REAL, PAY_AMT5 REAL, PAY_AMT6 REAL,
-        Default_Status INTEGER,
-        FOREIGN KEY (Customer_ID) REFERENCES Dim_Customer(Customer_ID),
-        FOREIGN KEY (Demographic_ID) REFERENCES Dim_Demographics(Demographic_ID)
-    )
-    """)
-
-    # -------------------------------------------------------------------------
-    # 4. LOAD CONTINUED: Insert Data Row-by-Row inside tables
-    # -------------------------------------------------------------------------
-    print("🚀 [ETL] Loading structured mappings into Relational Tables...")
-
-    try:
-        for idx, row in df.iterrows():
-            cust_id = int(row["ID"])
-            age = int(row["AGE"])
-
-            # A. Populate Dim_Demographics
-            cursor.execute(
-                "INSERT INTO Dim_Demographics (Age, Age_Group) VALUES (?, ?)",
-                (age, get_age_group(age)),
-            )
-            demo_id = cursor.lastrowid
-
-            # B. Populate Dim_Customer (IGNORE if duplicate customer keys exist)
-            # FIXED: Added the missing 4th '?' placeholder to match the 4 columns listed
-            cursor.execute(
-                """
-                INSERT OR IGNORE INTO Dim_Customer (Customer_ID, Gender, Education_Level, Marital_Status)
-                VALUES (?, ?, ?, ?)
-            """,
-                (
-                    cust_id,
-                    gender_map.get(int(row["SEX"]), "Others"),
-                    edu_map.get(int(row["EDUCATION"]), "Others"),
-                    marriage_map.get(int(row["MARRIAGE"]), "Others"),
-                ),
-            )
-
-            # C. Populate Central Fact Table linking foreign entities
-            cursor.execute(
-                """
-                INSERT INTO Fact_Credit_Risk (
-                    Customer_ID, Demographic_ID, LIMIT_BAL, 
-                    PAY_0, PAY_2, PAY_3, PAY_4, PAY_5, PAY_6,
-                    BILL_AMT1, BILL_AMT2, BILL_AMT3, BILL_AMT4, BILL_AMT5, BILL_AMT6,
-                    PAY_AMT1, PAY_AMT2, PAY_AMT3, PAY_AMT4, PAY_AMT5, PAY_AMT6,
-                    Default_Status
-                ) VALUES (?,?,?, ?,?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?,?, ?)
-            """,
-                (
-                    cust_id,
-                    demo_id,
-                    float(row["LIMIT_BAL"]),
-                    int(row["PAY_0"]), int(row["PAY_2"]), int(row["PAY_3"]), 
-                    int(row["PAY_4"]), int(row["PAY_5"]), int(row["PAY_6"]),
-                    float(row["BILL_AMT1"]), float(row["BILL_AMT2"]), float(row["BILL_AMT3"]), 
-                    float(row["BILL_AMT4"]), float(row["BILL_AMT5"]), float(row["BILL_AMT6"]),
-                    float(row["PAY_AMT1"]), float(row["PAY_AMT2"]), float(row["PAY_AMT3"]), 
-                    float(row["PAY_AMT4"]), float(row["PAY_AMT5"]), float(row["PAY_AMT6"]),
-                    int(row["class"]),
-                ),
-            )
-
-        # Apply changes to disk file
-        conn.commit()
-        print(
-            "✅ [ETL] Star Schema built and data loaded perfectly without type issues."
-        )
-
-    except Exception as e:
-        conn.rollback()
-        print(f"❌ [ETL ERROR] Transaction failed! Rollback initiated: {e}")
-        raise e
-
-    finally:
-        conn.close()
+    # ── PIPELINE TERMINATION METRICS REPORT ──────────────────────────────────
+    _banner("PIPELINE RUN COMPLETED SUCCESSFULLY")
+    total = time.time() - pipeline_start
+    print("  Total End-to-End Execution Time : {:.2f}s".format(total))
+    print("  Database Warehouse Location     : {}".format(DB_PATH))
+    print("  Output Reports Location        : {}".format(OUTPUT_DIR))
+    print("="*70)
 
 
 if __name__ == "__main__":
-    # Test execution for debugging paths locally
-    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-    TEST_CSV = os.path.join(SCRIPT_DIR, "../data/TaiwanData.csv")
-    TEST_DB = os.path.join(SCRIPT_DIR, "../data/Warehouse_Credit_Risk.db")
-
-    print("🤖 Running local isolated module validation test...")
-    build_star_schema(TEST_CSV, TEST_DB)
+    main()
