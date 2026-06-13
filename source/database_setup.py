@@ -30,14 +30,6 @@ def build_star_schema(csv_path, db_path):
             f"❌ [ERROR] Raw data file nahi mili is path par: {csv_path}"
         )
 
-    # Clean old database file if exists to wipe out corrupted binary data types
-    if os.path.exists(db_path):
-        print("🗑️ [ETL] Removing existing database file for a fresh clean rebuild...")
-        try:
-            os.remove(db_path)
-        except Exception as e:
-            print(f"⚠️ [WARNING] Could not remove old DB file, attempting overwrite: {e}")
-
     # -------------------------------------------------------------------------
     # 1. EXTRACT: Read the Raw Flat File Data
     # -------------------------------------------------------------------------
@@ -49,7 +41,7 @@ def build_star_schema(csv_path, db_path):
     # -------------------------------------------------------------------------
     print("🛠️ [ETL] Transforming data & preparing dimension encodings...")
 
-    # Data Cleaning standardisation
+    # Data Cleaning standardisation (Jaise aapke main models me thii)
     df["EDUCATION"] = df["EDUCATION"].clip(1, 4)
     df["MARRIAGE"] = df["MARRIAGE"].clip(1, 3)
 
@@ -78,6 +70,7 @@ def build_star_schema(csv_path, db_path):
     # -------------------------------------------------------------------------
     # 3. LOAD: Connect to DB and Create Star Schema Tables (DDL)
     # -------------------------------------------------------------------------
+    # Ensure target directory exists before establishing connection
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
 
     conn = sqlite3.connect(db_path)
@@ -131,12 +124,13 @@ def build_star_schema(csv_path, db_path):
     # -------------------------------------------------------------------------
     print("🚀 [ETL] Loading structured mappings into Relational Tables...")
 
+    # For faster throughput loading performance, we use a single transaction block
     try:
         for idx, row in df.iterrows():
             cust_id = int(row["ID"])
             age = int(row["AGE"])
 
-            # A. Populate Dim_Demographics
+            # A. Populate Dim_Demographics & capture the identity sequence ID
             cursor.execute(
                 "INSERT INTO Dim_Demographics (Age, Age_Group) VALUES (?, ?)",
                 (age, get_age_group(age)),
@@ -144,7 +138,6 @@ def build_star_schema(csv_path, db_path):
             demo_id = cursor.lastrowid
 
             # B. Populate Dim_Customer (IGNORE if duplicate customer keys exist)
-            # FIXED: Added the missing 4th '?' placeholder to match the 4 columns listed
             cursor.execute(
                 """
                 INSERT OR IGNORE INTO Dim_Customer (Customer_ID, Gender, Education_Level, Marital_Status)
@@ -152,9 +145,9 @@ def build_star_schema(csv_path, db_path):
             """,
                 (
                     cust_id,
-                    gender_map.get(int(row["SEX"]), "Others"),
-                    edu_map.get(int(row["EDUCATION"]), "Others"),
-                    marriage_map.get(int(row["MARRIAGE"]), "Others"),
+                    gender_map.get(row["SEX"], "Others"),
+                    edu_map.get(row["EDUCATION"], "Others"),
+                    marriage_map.get(row["MARRIAGE"], "Others"),
                 ),
             )
 
@@ -172,13 +165,25 @@ def build_star_schema(csv_path, db_path):
                 (
                     cust_id,
                     demo_id,
-                    float(row["LIMIT_BAL"]),
-                    int(row["PAY_0"]), int(row["PAY_2"]), int(row["PAY_3"]), 
-                    int(row["PAY_4"]), int(row["PAY_5"]), int(row["PAY_6"]),
-                    float(row["BILL_AMT1"]), float(row["BILL_AMT2"]), float(row["BILL_AMT3"]), 
-                    float(row["BILL_AMT4"]), float(row["BILL_AMT5"]), float(row["BILL_AMT6"]),
-                    float(row["PAY_AMT1"]), float(row["PAY_AMT2"]), float(row["PAY_AMT3"]), 
-                    float(row["PAY_AMT4"]), float(row["PAY_AMT5"]), float(row["PAY_AMT6"]),
+                    row["LIMIT_BAL"],
+                    row["PAY_0"],
+                    row["PAY_2"],
+                    row["PAY_3"],
+                    row["PAY_4"],
+                    row["PAY_5"],
+                    row["PAY_6"],
+                    row["BILL_AMT1"],
+                    row["BILL_AMT2"],
+                    row["BILL_AMT3"],
+                    row["BILL_AMT4"],
+                    row["BILL_AMT5"],
+                    row["BILL_AMT6"],
+                    row["PAY_AMT1"],
+                    row["PAY_AMT2"],
+                    row["PAY_AMT3"],
+                    row["PAY_AMT4"],
+                    row["PAY_AMT5"],
+                    row["PAY_AMT6"],
                     int(row["class"]),
                 ),
             )
@@ -186,7 +191,7 @@ def build_star_schema(csv_path, db_path):
         # Apply changes to disk file
         conn.commit()
         print(
-            "✅ [ETL] Star Schema built and data loaded perfectly without type issues."
+            "✅ [ETL] Star Schema built and data loaded perfectly without issues."
         )
 
     except Exception as e:
